@@ -1,3 +1,5 @@
+
+markdown
 # VLM Evaluation Pipeline
 
 ## Overview
@@ -9,106 +11,81 @@ This pipeline evaluates the Qwen3-VL-2B-Instruct vision-language model on a 100-
 ### Prerequisites
 
 - Python 3.10 or higher
-- 16GB+ RAM (8GB minimum)
-- GPU recommended (CUDA or MPS), but CPU works (slower)
-- ~4GB disk space for model weights
+- 16GB+ RAM if running on CPU (GPU strongly recommended)
+- CUDA GPU or Apple Silicon (MPS) recommended; CPU works but is slow and memory-constrained
+- ~4.3GB disk space for model weights
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone <your-repo-url>
+git clone 
 cd vlm-eval
 
-# Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Sync dependencies
 uv sync
-
-# Activate virtual environment
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
 ### Running the Pipeline
 
 ```bash
-# Run full evaluation (100 samples)
+# Full evaluation (100 samples)
 uv run python src/main.py
 
-# Run smoke test (single sample with demo image)
-uv run python src/model.py
-
-# Quick data load test
-uv run python src/data.py
 ```
 
 ## Project Structure
 
-```
 vlm-eval/
-├── pyproject.toml          # Project metadata and dependencies
-├── uv.lock                 # Locked dependencies for reproducibility
-├── .python-version         # Python version (3.10)
+├── pyproject.toml
+├── uv.lock
+├── .python-version
 ├── src/
-│   ├── main.py             # Entry point
-│   ├── model.py            # Qwen3-VL-2B-Instruct loader + inference
-│   ├── data.py             # MMMU subset loader (4 subjects, 25 samples each)
-│   ├── parser.py           # Answer extraction from model responses
-│   ├── pipeline.py         # Evaluation loop with resumability
-│   └── metrics.py          # Metrics aggregation + summary generation
+│ ├── main.py # entry point
+│ ├── model.py # Qwen3-VL-2B-Instruct loading + inference
+│ ├── data.py # MMMU subset loader (4 subjects, 25 samples each)
+│ ├── parser.py # answer extraction from model responses
+│ ├── pipeline.py # evaluation loop with resumability
+│ └── metrics.py # metrics aggregation + summary generation
 ├── results/
-│   ├── trajectories.jsonl  # Per-sample structured logs (append-only)
-│   └── summary.json        # Aggregate metrics
+│ ├── trajectories.jsonl
+│ └── summary.json
 └── README.md
-```
+
 
 ## Design Decisions
 
 ### Resumability
 
-The pipeline writes trajectories to `trajectories.jsonl` **immediately after each sample completes**. If interrupted:
+`trajectories.jsonl` is written in append mode with an explicit flush after every single sample, not held in memory and written at the end. On startup, the pipeline reads any existing file, extracts the set of `sample_id`s already present, and skips them. A sample counts as "done" once it has any record at all, successful or errored, since retrying a sample that fails identically every time (an OOM on a specific image, for example) would stall a resume indefinitely rather than move forward.
 
-1. On restart, it reads existing trajectories and extracts completed `sample_id`s
-2. Skips any sample already logged (successful or errored)
-3. Continues from the next unprocessed sample
+Tested by killing the process mid-run and restarting; it resumes from the next unprocessed sample with no re-computation and no duplicate records.
 
-To test: Run the pipeline, interrupt it (Ctrl+C), then run it again. It will resume from where it left off without re-running completed samples.
+### Model Loading and Device Placement
 
-### Error Handling
+The model loads via `AutoModelForImageTextToText`, which dispatches to the correct Qwen3-VL architecture from the checkpoint's config rather than hardcoding a model class. Device selection falls back gracefully: CUDA if available, otherwise MPS (Apple Silicon), otherwise CPU. Precision is chosen per device: bfloat16 on CUDA, float16 on MPS, float32 on CPU, since defaulting to float32 everywhere would roughly double the ~4.3GB checkpoint's memory footprint.
 
-- **Every sample produces a trajectory record**, even on error
-- No silent skips — all 100 samples are accounted for
-- Errors are logged with full traceback in the `error` field
-- The pipeline continues processing after non-fatal errors
+`low_cpu_mem_usage=True` reduces peak RAM during weight deserialization by streaming weights in rather than allocating duplicate buffers. The processor is loaded with explicit `min_pixels`/`max_pixels` bounds (`256*28*28` to `1280*28*28`) to cap the number of visual patch tokens Qwen3-VL generates per image; without this bound, high-resolution MMMU images can drive the attention computation during vision prefill to allocate several GB on its own, independent of the model weights themselves.
 
 ### Answer Extraction
 
-The parser handles common Qwen response patterns:
+The parser tries several patterns in order of specificity before falling back to a bare letter search:
 
-```
-"The answer is B" → "B"
-"I think B is correct because..." → "B"
-"Option C" → "C"
-"B." → "B"
-"B: The answer is..." → "B"
-```
+"The answer is B" -> B
+"I think B is correct" -> B
+"Option C" -> C
+"B." -> B
+"(A)" -> A
 
-If extraction fails, the record includes `"extraction_succeeded": false` and continues.
 
-### Memory Management
+If nothing matches, it returns `(None, False)` rather than guessing, and the pipeline logs the failure and moves on. It never crashes on unparseable output.
 
-The model loads with:
-- **4-bit quantization** (if `bitsandbytes` is available)
-- **Device mapping**: CUDA → MPS → CPU fallback
-- **`low_cpu_mem_usage=True`** to reduce peak memory during loading
-- **`max_pixels=1280*28*28`** to prevent CUDA OOM on high-res images
+### Error Handling
+
+Every sample produces exactly one trajectory record, success or failure. Inference failures (OOM, malformed input, etc.) are caught, logged with the exception message in the `error` field, and the loop continues. No sample is ever silently skipped.
 
 ## Results
 
-### Summary Metrics
-
-```
 Model: Qwen/Qwen3-VL-2B-Instruct
 Total Samples: 100
 Completed: 100
@@ -119,102 +96,47 @@ Avg Inference Time: 18.88s
 Total Runtime: 1900.6s
 
 Per-Subject Accuracy:
-  Art: 52.00%
-  Biology: 36.00%
-  Architecture & Engineering: 12.00%
-  Accounting: 8.00%
-```
+Art: 52.00%
+Biology: 36.00%
+Architecture & Engineering: 12.00%
+Accounting: 8.00%
+
 
 ### Observations
 
-**Best Performance: Art (52%)**
-- Visual recognition tasks (identifying paintings, artists, styles)
-- Questions are typically straightforward: "Who painted X?"
-- Model outputs a single letter consistently
+Art scored highest by a wide margin (52%). Its questions are mostly direct visual recognition ("who painted this," "what is this called"), and the model typically answers with a single letter or a short phrase, leaving little room for parse failure.
 
-**Worst Performance: Accounting (8%)**
-- Multi-step reasoning required
-- Domain-specific knowledge (formulas, financial data)
-- Questions are longer and more complex
+Accounting and Architecture/Engineering scored lowest (8% and 12%). These require multi-step numeric reasoning, and the model's responses are long derivations rather than short answers.
 
-**Parse Failures (41%)**
-- Qwen often outputs full explanations instead of just the letter
-- Common failure: "To determine the correct answer, we need to..." without including the letter
-- This is expected behavior for instruction-tuned models
+### Known Issue: Response Truncation
 
-### Example Trajectory
+A meaningful share of the 41% parse failure rate is not the model failing to reach an answer, it's the response being cut off by the `max_new_tokens` generation limit before it states a concluding letter. This shows up directly in the logged responses: several end mid-word (e.g. cut off at "...in the trans" where the model was clearly heading toward "transmembrane," or mid-calculation with no final statement). This pattern concentrates in the same subjects that score lowest, since Qwen answers quantitative, multi-step questions with long chain-of-thought before committing to a letter.
 
-```json
-{
-  "sample_id": "validation_Accounting_11",
-  "subject": "Accounting",
-  "question": "Donna Donie, CFA, has a client who believes...",
-  "choices": ["A: $9.00", "B: $5.00", "C: the Maximum possible loss is unlimited"],
-  "correct_answer": "A",
-  "prompt_sent": "Donna Donie, CFA, has a client... Answer with the letter...",
-  "raw_model_response": "To calculate the maximum possible loss...",
-  "extracted_answer": "A",
-  "extraction_succeeded": true,
-  "is_correct": true,
-  "inference_time_seconds": 14.178,
-  "error": null
-}
-```
 
 ## Issues Encountered
 
-### 1. Model Loading
+**`torch_dtype` deprecation.** A recent `transformers` release renamed `torch_dtype` to `dtype` in `from_pretrained`. The old parameter name loaded silently with a warning, but caused inference to fail downstream. Fixed by renaming the parameter.
 
-**Issue**: First run downloads ~4GB of model weights.
+**`processor.apply_chat_template(..., return_dict=True, return_tensors="pt")` returning a dict without `.to()`.** Calling `.to(device)` directly on this return value crashed with `AttributeError: 'dict' object has no attribute 'to'`. Fixed by separating template rendering (`tokenize=False`, text only) from tensor construction (a separate `processor(text=..., images=...)` call), then moving only the tensor values in the resulting dict to the target device individually, leaving any non-tensor entries untouched.
 
-**Resolution**: This is expected. The model is cached in `~/.cache/huggingface/` after first download.
 
-### 2. CUDA Memory
+**Cascade effect.** These three issues compounded: the dtype warning meant the model loaded in an unexpected precision, the `.to()` crash meant inputs never reached the correct device, and the resulting device mismatch caused every single `generate()` call to fail. The first full run showed `"inference_errors": 100, "completed": 0`, all 100 samples failing in the try/except boundary in `pipeline.py` rather than crashing the whole loop, which is exactly what that boundary is for. Isolating and fixing each bug in turn resolved the cascade.
 
-**Issue**: Some high-resolution images (up to `max_pixels`) cause CUDA out of memory.
+**Local machine memory constraints.** The original development machine has 4GB total RAM; loading the ~4.3GB checkpoint in float32 on CPU (the default without an explicit dtype) requires roughly 8.5GB, which the OS killed before it could complete. Moved execution to Google Colab (T4 GPU, 15GB VRAM) while keeping the exact same codebase; nothing in `src/` differs between the local and cloud execution paths, only where it's run.
 
-**Resolution**: Set `max_pixels=1280*28*28` in the processor. This balances image quality with memory constraints.
-
-### 3. Long Inference Times
-
-**Issue**: Some samples take 20-40 seconds on a 4GB GPU.
-
-**Resolution**: This is expected for a 2B parameter model on limited hardware. The pipeline logs per-sample timing for analysis.
-
-### 4. Parse Failures
-
-**Issue**: 41% of responses couldn't be parsed.
-
-**Resolution**: This is a model behavior, not a pipeline bug. The parser is permissive and logs failures. In production, you might use a more aggressive regex or a secondary model to extract answers.
+**Colab session persistence.** Colab's local disk is ephemeral across full session recycles, meaning both the downloaded model cache and `results/trajectories.jsonl` would be lost on a hard disconnect, not just a soft restart. Mounted Google Drive and set `HF_HOME` to a Drive path before loading the model, and cloned the repo onto Drive so `results/` also persists there. This means resumability holds not just within one live session but across a fully dead and restarted one.
 
 ## Dependencies
 
-Key packages:
+Core packages (pinned versions in `pyproject.toml`):
 
-```
-torch>=2.5.0
-transformers>=4.46.0
-qwen-vl-utils>=0.0.8
-datasets>=3.0.0
-pillow>=10.0.0
-tqdm>=4.66.0
-```
+torch
+transformers
+accelerate
+pillow
+datasets
+huggingface_hub
 
-Full dependencies are pinned in `pyproject.toml`.
-
-## Notes
-
-- The pipeline is designed to be **swappable** — replace the model ID in `model.py` and the benchmark in `data.py`
-- Results are saved in `results/` — trajectories are append-only, summary is overwritten
-- The pipeline is **deterministic** with fixed random seeds
-
-## Future Improvements
-
-1. **Batch inference**: Process multiple samples per GPU pass for speed
-2. **Quantization**: Add 4-bit or 8-bit quantization options
-3. **Prompt engineering**: Experiment with chain-of-thought vs. direct answer prompts
-4. **Model swapping**: Add support for other VLMs (Llama-3.2-Vision, Phi-3.5-Vision)
-5. **Visualization**: Generate confusion matrices and error analysis plots
 
 ## License
 
