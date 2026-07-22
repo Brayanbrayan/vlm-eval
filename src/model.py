@@ -1,106 +1,103 @@
 """
 model.py — Model loading and inference for Qwen3-VL-2B-Instruct.
-
-Handles device placement (cuda -> mps -> cpu fallback) and exposes a
-single run_inference() entry point that pipeline.py calls per sample.
 """
 
-import sys
+import time
 import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText
-
-MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
-def get_device() -> str:
-    """Pick the best available device, falling back gracefully."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+class Qwen3VL:
+    def __init__(self, model_id: str = "Qwen/Qwen3-VL-2B-Instruct"):
+        self.model_id = model_id
+        
+        # Device detection
+        if torch.cuda.is_available():
+            self.device = "cuda"
+            self.dtype = torch.bfloat16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = "mps"
+            self.dtype = torch.float16
+        else:
+            self.device = "cpu"
+            self.dtype = torch.float32
 
+        print(f"--> Target device: [{self.device.upper()}] | Precision: [{self.dtype}]", flush=True)
 
-def get_dtype(device: str) -> torch.dtype:
-    """bf16 on CUDA, fp16 on MPS, fp32 on CPU."""
-    if device == "cuda":
-        return torch.bfloat16
-    if device == "mps":
-        return torch.float16
-    return torch.float32
+        print("--> Loading processor...", flush=True)
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_id,
+            min_pixels=256 * 28 * 28,
+            max_pixels=1280 * 28 * 28,
+        )
 
+        print("--> Loading model weights...", flush=True)
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            self.model_id,
+            dtype=self.dtype,
+            device_map="auto" if self.device == "cuda" else None,
+            low_cpu_mem_usage=True,
+        )
+        
+        #FIX 1: If not using device_map, move model to device explicitly
+        if self.device != "cuda":
+            self.model = self.model.to(self.device)
+        
+        self.model.eval()
+        print("--> Model loaded successfully!", flush=True)
 
-def load_model(model_id: str = MODEL_ID):
-    """Load model + processor onto the best available device."""
-    device = get_device()
-    dtype = get_dtype(device)
+    def predict(self, image=None, prompt: str | None = None, max_new_tokens: int = 128):
+        """Run inference and return (response_text, elapsed_seconds)."""
+        # Build messages
+        if isinstance(image, (list, tuple)):
+            image_list = list(image)
+        else:
+            image_list = [image] if image is not None else []
 
-    print(f"--> Target device: [{device.upper()}] | Precision: [{dtype}]", flush=True)
-    
-    print("--> Loading processor...", flush=True)
-    # 1. Cap max visual pixels to prevent memory spikes in attention layers
-    processor = AutoProcessor.from_pretrained(
-        model_id,
-        min_pixels=256 * 28 * 28,
-        max_pixels=1280 * 28 * 28,  # Prevents runaway image token sequence length
-    )
+        content = [{"type": "image", "image": img} for img in image_list]
+        content.append({"type": "text", "text": prompt or ""})
+        messages = [{"role": "user", "content": content}]
 
-    print("--> Loading model weights (using low_cpu_mem_usage)...", flush=True)
-    
-    # AutoModelForImageTextToText handles Qwen3-VL cleanly
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        dtype=dtype,
-        device_map="auto" if device == "cuda" else None,
-        low_cpu_mem_usage=True,
-    )
-    
-    if device in ["cpu", "mps"]:
-        model.to(device)
+        #FIX 2: Apply template WITHOUT returning tensors first
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
 
-    model.eval()
-    print("--> Model successfully loaded into memory!", flush=True)
+        #FIX 3: Process the text + images together, then move to device
+        inputs = self.processor(
+            text=text,
+            images=image_list if image_list else None,
+            return_tensors="pt",
+        )
 
-    return model, processor, device
+        #FIX 4: Move ALL tensors to the correct device
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
+        start = time.time()
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+            )
 
-def build_messages(images: list, question: str, choices: list[str]) -> list[dict]:
-    """Construct the chat-format message list Qwen3-VL expects."""
-    content = [{"type": "image", "image": img} for img in images]
-    prompt_text = (
-        f"{question}\n\n" + "\n".join(choices)
-        + "\n\nAnswer with the letter of the correct option only."
-    )
-    content.append({"type": "text", "text": prompt_text})
-    return [{"role": "user", "content": content}]
+        #FIX 5: Decode only the generated portion
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]
 
+        response = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
 
-def run_inference(model, processor, device: str, images: list, question: str,
-                  choices: list[str], max_new_tokens: int = 128) -> tuple[str, str]:
-    """Run one sample through the model. Returns (raw_response, prompt_sent)."""
-    messages = build_messages(images, question, choices)
+        return response, round(time.time() - start, 3)
 
-    inputs = processor.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt",
-    ).to(device)
-
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-
-    trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-
-    prompt_repr = (
-        f"{question}\n\n" + "\n".join(choices)
-        + "\n\nAnswer with the letter of the correct option only."
-    )
-    return output_text, prompt_repr
+    # Alias for pipeline compatibility
+    def generate(self, image=None, prompt: str | None = None, **kwargs):
+        return self.predict(image=image, prompt=prompt, **kwargs)
 
 
 if __name__ == "__main__":
@@ -108,24 +105,12 @@ if __name__ == "__main__":
     import requests
     from io import BytesIO
 
-    print("--> Starting smoke test...", flush=True)
-    url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+    print("--> Smoke testing Qwen3VL class...", flush=True)
+    vlm = Qwen3VL()
     
-    try:
-        print("--> Fetching demo image...", flush=True)
-        img = Image.open(BytesIO(requests.get(url, timeout=10).content))
+    url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+    img = Image.open(BytesIO(requests.get(url, timeout=10).content))
 
-        model, processor, device = load_model()
-
-        print("--> Running model inference...", flush=True)
-        response, prompt = run_inference(
-            model, processor, device,
-            images=[img],
-            question="What animal is shown in this image?",
-            choices=["A: cat", "B: dog", "C: rabbit", "D: bird"],
-        )
-        print("\n=== SMOKE TEST SUCCESS ===", flush=True)
-        print("Raw response:", repr(response), flush=True)
-        
-    except Exception as e:
-        print(f"\n[ERROR] Smoke test failed with exception: {e}", file=sys.stderr, flush=True)
+    out, elapsed = vlm.predict(img, "What animal is shown in this image?")
+    print("Response:", repr(out), flush=True)
+    print("Elapsed seconds:", elapsed, flush=True)

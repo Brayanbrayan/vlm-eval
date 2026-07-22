@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen3-VL-2B-Instruct",
+  "total_samples": 100,
+  "completed": 100,
+  "overall_accuracy": 0.27,
+  "per_subject_accuracy": {
+    "Accounting": 0.08,
+    "Architecture_and_Engineering": 0.12,
+    "Art": 0.52,
+    "Biology": 0.36
+  },
+  "parse_failure_rate": 0.41,
+  "inference_errors": 0,
+  "avg_inference_time_seconds": 18.883,
+  "total_runtime_seconds": 1900.6
+}
